@@ -4,25 +4,16 @@
 # Render PDF files needed for printing labels.
 #
 #
-import sys, os, csv, PIL, pdb, re, click
-import logging
-from io import BytesIO
+import os
 from PIL import Image
-from binascii import b2a_hex, a2b_hex
+from binascii import a2b_hex
 from collections import Counter
 
 from reportlab.pdfgen.canvas import Canvas
-from reportlab.lib.units import inch, cm
-#from reportlab.graphics import renderPDF
-#from reportlab.graphics.shapes import Drawing 
+from reportlab.lib.units import inch
 from reportlab.pdfbase import pdfdoc
-from reportlab.lib import colors
 from reportlab import rl_config
 
-# just for fonts
-from reportlab.lib.fonts import addMapping
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
 from pdfrw import PdfReader
 from pdfrw.buildxobj import pagexobj
@@ -38,6 +29,7 @@ rl_config.pageCompression = 0
 class placeholders:
     addr = 'ADDRESS_XXXXXXXXXXXXXXXXXXXXXXXXXXXXX'                      # 37 long
     privkey = 'PRIVKEY_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'     # 51 long
+    bbqr = 'BBQR_'     # 5 long
 
     # rather than Tokyo, I chose Chiba Prefecture in ShiftJIS encoding...
     header = b'%PDF-1.3\n%\x90\xe7\x97t\x8c\xa7 Coldcard Paper Wallet Template\n'
@@ -55,13 +47,11 @@ class myPDFFile(pdfdoc.PDFFile):
 pdfdoc.PDFFile = myPDFFile
 
 
-class TemplateBuilder(object):
+class TemplateBuilder:
     def __init__(self, input_template, output_fname=None, canvas=None):
 
         pages = PdfReader(input_template).pages
         self.xobjs = [(pagexobj(x),) for x in pages]
-
-        assert len(pages) == 1, "only supporting a single page"
 
         if output_fname:
             # probably an object, not filename, but whatevers
@@ -102,44 +92,6 @@ class TemplateBuilder(object):
                 x += xobj.BBox[2]
 
             c.showPage()
-
-    def make_image_page(self, img, label=None, width=4*inch, height=6*inch, footnote=None):
-        '''
-            Whole page is one raster image. XXX untested
-        '''
-        c = self.canvas
-
-        c.setPageSize((width, height))
-
-        from reportlab.lib.utils import ImageReader
-
-        X_SHIFT = 0
-        Y_SHIFT = -0.120 * inch
-
-        # paste in the image
-        c.drawImage(ImageReader(img, ident=str(label)), X_SHIFT,Y_SHIFT,
-                    width=width, height=height, preserveAspectRatio=True)
-
-        c.showPage()
-
-    def simple_text(self, msg, x=1*inch, y=1*inch):
-        # draw a single line of simple stuff
-
-        c = self.canvas
-
-        c.saveState()
-
-        c.setFillColorRGB(0,0,0)
-        c.setStrokeColorRGB(0,0,0)
-        c.setFont("Courier-Bold", 6)
-
-        # centered horizontally at target spot
-        #c.drawCentredString(x, y, msg)
-        # right-justified
-        c.drawRightString(x, y, msg)
-
-        c.restoreState()
-
     
     def finalize(self):
         c = self.canvas
@@ -149,8 +101,105 @@ class TemplateBuilder(object):
         c.setProducer("Templator")
         self.canvas.save()
 
+    def add_text(self, msg, x,y, font_size=12, font_name='Courier'):
+        c = self.canvas
+        c.saveState()
+
+        # change color: black
+        c.setFillColorRGB(0,0,0)
+        c.setStrokeColorRGB(0,0,0)
+
+        # size and font name.
+        c.setFont(font_name, font_size)
+
+        c.drawString(x, y, msg)
+
+        c.restoreState()
+
+    def add_qr_spot(self, name, subtext, x,y, page_size=2.25*inch, SZ=33*8):
+
+        # make a temp image to get started, data not critical except that
+        # must be unique because it gets hashed into eh xobj name
+
+        c = self.canvas
+        c.saveState()
+
+        # change color: black
+        c.setFillColorRGB(0,0,0)
+        c.setStrokeColorRGB(0,0,0)
+
+
+        img = Image.new('L', (SZ,SZ))
+        img.putdata(name.encode('utf-8'))
+
+        from reportlab.lib.utils import ImageReader
+
+        width = height = page_size
+
+        # paste in the image
+        c.drawImage(ImageReader(img, ident='qr1'), x, y,
+                    width=width, height=height, preserveAspectRatio=True)
+
+        # Hack Zone:
+        # - find image just created, and change it to hex encoded, non-compressed form
+        # - also put magic pattern into data, which the Coldcard can find
+        # - see: pp/reportlab/pdfgen/pdfimages.py
+        # - and: reportlab/pdfgen/canvas.py drawImage()
+        # - add: reportlab/pdfbase/pdfdoc.py PDFImageXObject()
+        line = c._code[-2]
+        assert line.endswith(' Do')
+        handle = line[1:-3]
+
+        ximg = c._doc.idToObject.get(handle)
+        assert ximg
+        assert ximg.width == ximg.height == SZ      # pixel sizes
+
+        ximg._filters = ('ASCIIHexDecode',)      # kill the Flate (zlib)
+        ximg.bitsPerComponent = 1
+
+        # Stream itself, is just hex of raw pixels.
+        # - add whitespace as needed, so will split newline each raster line
+        # - first line reserved for magic data pattern, rest is dont-care
+        # - each byte is 8 pixels of monochrome data
+        # - left-to-right, top-to-bottom
+
+        fl = ('QR:%s' % name).encode('ascii').ljust(SZ//8, b'\xff')
+        assert len(fl) == (SZ//8)
+
+        # make a placeholder image for sizing/preview purposes. Not a real QR.
+        lines = []
+
+        if name.startswith("bbqr"):
+            ff = 'qrsample-bbqr.pnm'
+        else:
+            ff = f'qrsample-{name}.pnm'
+
+        img = Image.open(ff)
+        assert img.size == (SZ, SZ), 'need another sample'
+        sample = img.tobytes()
+        for o in range(0, len(sample), SZ//8):
+            lines.append(sample[o:o+(SZ//8)])
+
+        lines[0] = fl
+        ximg.streamContent = '\n'.join(ln.hex().upper() for ln in lines)
+        ximg.streamContent += '\n'
+
+        if subtext:
+            # pick font size; doesn't try to suit size of QR, more like readable size
+            font_size = 8 if len(subtext) > 40 else 11
+            c.setFont("Courier", font_size)
+
+            # these strings are trival to find in output PDF once A85 encoding is disabled
+            c.drawCentredString(x+(page_size/2), y - 5 - font_size, subtext)
+
+        c.restoreState()
+
 
 class WalletBuilder(TemplateBuilder):
+    def __init__(self, input_template, output_fname=None, canvas=None):
+        super().__init__(input_template, output_fname, canvas)
+        assert len(self.xobjs) == 1, "only supporting a single page"
+
     def insert_values(self, page_num, template_name):
 
         if template_name == 'placeholder':
@@ -203,100 +252,27 @@ class WalletBuilder(TemplateBuilder):
     def privkey_at(self, x,y, **kws):
         self.add_text(placeholders.privkey, x, y, **kws)
 
-    def add_text(self, msg, x,y, font_size=12, font_name='Courier'):
-        c = self.canvas
-        c.saveState()
 
-        # change color: black
-        c.setFillColorRGB(0,0,0)
-        c.setStrokeColorRGB(0,0,0)
+class BBQrBackupBuilder(TemplateBuilder):
+    def __init__(self, input_template, output_fname=None):
+        super().__init__(input_template, output_fname)
 
-        # size and font name.
-        c.setFont(font_name, font_size)
-
-        c.drawString(x, y, msg)
-
-        c.restoreState()
-
-    def add_qr_spot(self, name, subtext, x,y, page_size=2.25*inch, SZ=33*8):
-
-        # make a temp image to get started, data not critical except that
-        # must be unique because it gets hashed into eh xobj name
-
-        c = self.canvas
-        c.saveState()
-
-        # change color: black
-        c.setFillColorRGB(0,0,0)
-        c.setStrokeColorRGB(0,0,0)
+    def insert_values(self, page_num, template_name):
+        # assert template_name == "empty"
+        where = f'{page_num:02}'
+        self.add_qr_spot('bbqr'+where, placeholders.bbqr+where, 1.7*inch,4*inch,
+                         page_size=177*2,SZ=177*8)
 
 
-        img = Image.new('L', (SZ,SZ))
-        img.putdata(name.encode('utf-8'))
-
-        from reportlab.lib.utils import ImageReader
-
-        width = height = page_size
-
-        # paste in the image
-        c.drawImage(ImageReader(img, ident='qr1'), x, y,
-                    width=width, height=height, preserveAspectRatio=True)
-
-        # Hack Zone: 
-        # - find image just created, and change it to hex encoded, non-compressed form
-        # - also put magic pattern into data, which the Coldcard can find
-        # - see: pp/reportlab/pdfgen/pdfimages.py
-        # - and: reportlab/pdfgen/canvas.py drawImage()
-        # - add: reportlab/pdfbase/pdfdoc.py PDFImageXObject()
-        line = c._code[-2] 
-        assert line.endswith(' Do')
-        handle = line[1:-3]
-
-        ximg = c._doc.idToObject.get(handle)
-        assert ximg
-        assert ximg.width == ximg.height == SZ      # pixel sizes
-
-        ximg._filters = ('ASCIIHexDecode',)      # kill the Flate (zlib)
-        ximg.bitsPerComponent = 1
-
-        # Stream itself, is just hex of raw pixels.
-        # - add whitespace as needed, so will split newline each raster line
-        # - first line reserved for magic data pattern, rest is dont-care
-        # - each byte is 8 pixels of monochrome data
-        # - left-to-right, top-to-bottom
-
-        fl = ('QR:%s' % name).encode('ascii').ljust(SZ//8, b'\xff')
-        assert len(fl) == (SZ//8)
-
-        # make a placeholder image for sizing/preview purposes. Not a real QR.
-        lines = []
-
-        img = Image.open(f'qrsample-{name}.pnm')
-        assert img.size == (SZ, SZ), 'need another sample'
-        sample = img.tobytes()
-        for o in range(0, len(sample), SZ//8):
-            lines.append(sample[o:o+(SZ//8)])
-
-        lines[0] = fl
-        ximg.streamContent = '\n'.join(ln.hex().upper() for ln in lines)
-        ximg.streamContent += '\n'
-
-        if subtext:
-            # pick font size; doesn't try to suit size of QR, more like readable size
-            font_size = 8 if len(subtext) > 40 else 11
-            c.setFont("Courier", font_size)
-
-            # these strings are trival to find in output PDF once A85 encoding is disabled
-            c.drawCentredString(x+(page_size/2), y - 5 - font_size, subtext)
-
-        c.restoreState()
-
-def file_checker(fname):
+def file_checker(fname, is_bbqr=False):
     raw = open(fname, 'rb').read()
 
     assert raw.startswith(placeholders.header), 'header wrong/missing'
-    assert placeholders.addr.encode('ascii') in raw, "payment addr (text) missing"
-    assert placeholders.privkey.encode('ascii') in raw, 'privkey (text) missing'
+    if not is_bbqr:
+        assert placeholders.addr.encode('ascii') in raw, "payment addr (text) missing"
+        assert placeholders.privkey.encode('ascii') in raw, 'privkey (text) missing'
+    else:
+        assert placeholders.bbqr.encode('ascii') in raw, 'bbqr (text) missing'
 
     lines = raw.split(b'\n')
 
@@ -316,7 +292,11 @@ def file_checker(fname):
             fl = fl.rstrip(b'\xff').decode('ascii')[3:]
             counts[fl] += 1
 
-    assert len(counts) == 2, "missing QR instances"
+    if is_bbqr:
+        assert len(counts) == 20
+    else:
+        assert len(counts) == 2, "missing QR instances"
+
     assert all(i==1 for i in counts.values()), "too many images?"
 
     print("Includes QR's: " + ', '.join(counts))
@@ -325,15 +305,21 @@ def file_checker(fname):
 
 if __name__ == '__main__':
 
-    for fn in [ 'coldcard-paper', 'placeholder']:
+    for fn in ['coldcard-paper', 'placeholder', 'empty20']:
 
         outfile = f'outputs/{fn}.pdf'
 
-        foo = WalletBuilder(f'templates/{fn}.pdf', outfile)
+        is_bbqr = (fn == "empty20")
+
+        if is_bbqr:
+            foo = BBQrBackupBuilder(f'templates/{fn}.pdf', outfile)
+        else:
+            foo = WalletBuilder(f'templates/{fn}.pdf', outfile)
+
         foo.make_custom(fn)
         foo.finalize()
 
-        file_checker(outfile)
+        file_checker(outfile, is_bbqr=is_bbqr)
         os.system(f'open {outfile}')
 
 # EOF
