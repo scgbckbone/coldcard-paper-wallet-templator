@@ -293,7 +293,7 @@ def file_checker(fname, is_bbqr=False):
             counts[fl] += 1
 
     if is_bbqr:
-        assert len(counts) == 20
+        assert len(counts) == 10
     else:
         assert len(counts) == 2, "missing QR instances"
 
@@ -305,11 +305,11 @@ def file_checker(fname, is_bbqr=False):
 
 if __name__ == '__main__':
 
-    for fn in ['coldcard-paper', 'placeholder', 'empty20']:
+    for fn in ['coldcard-paper', 'placeholder', 'empty10']:
 
         outfile = f'outputs/{fn}.pdf'
 
-        is_bbqr = (fn == "empty20")
+        is_bbqr = (fn == "empty10")
 
         if is_bbqr:
             foo = BBQrBackupBuilder(f'templates/{fn}.pdf', outfile)
